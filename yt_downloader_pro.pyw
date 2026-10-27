@@ -2,6 +2,8 @@ import os
 import sys
 import re
 import json
+import importlib
+import importlib.util
 import threading
 import time
 from pathlib import Path
@@ -97,33 +99,47 @@ def validate_url(url):
     domain_check = any(d in url.lower() for d in ['youtube.com', 'youtu.be', 'youtube-nocookie.com'])
     return domain_check and extract_video_id(url) is not None
 
-def is_ffmpeg_available():
+_ffmpeg_cache = {}
+
+
+def is_ffmpeg_available(refresh=False):
+    if 'ok' in _ffmpeg_cache and not refresh:
+        return _ffmpeg_cache['ok']
+
+    ok = False
     startupinfo = None
     if sys.platform == "win32":
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    
-    try:
-        subprocess.run(['ffmpeg', '-version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, startupinfo=startupinfo, check=True)
-        return True
-    except:
-        pass
 
     try:
-        script_dir = Path(__file__).parent.absolute()
-        if (script_dir / 'ffmpeg.exe').exists():
-            return True
-    except:
+        # timeout + DEVNULL: without a timeout this call can block forever when the
+        # process has no console to inherit (e.g. launched as a .pyw GUI app), which
+        # hangs the health-check thread at "Locating FFmpeg...".
+        subprocess.run(['ffmpeg', '-version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       startupinfo=startupinfo, check=True, timeout=10)
+        ok = True
+    except Exception:
         pass
 
-    try:
-        dpath = settings.get('download_path')
-        if dpath and (Path(dpath) / 'ffmpeg.exe').exists():
-            return True
-    except:
-        pass
+    if not ok:
+        try:
+            script_dir = Path(__file__).parent.absolute()
+            if (script_dir / 'ffmpeg.exe').exists():
+                ok = True
+        except Exception:
+            pass
 
-    return False
+    if not ok:
+        try:
+            dpath = settings.get('download_path')
+            if dpath and (Path(dpath) / 'ffmpeg.exe').exists():
+                ok = True
+        except Exception:
+            pass
+
+    _ffmpeg_cache['ok'] = ok
+    return ok
 
 def bind_mousewheel_scroll(canvas):
     def _on_mousewheel(event):
@@ -186,6 +202,11 @@ class Settings:
             'max_concurrent': 3,
             'sponsorblock':   True,
             'auto_paste':     True,
+            # YouTube anti-bot workarounds (see _build_youtube_workaround_opts):
+            # '' = auto (try browser cookies if available), or a browser name
+            # like 'chrome' / 'edge' / 'firefox', or 'cookies.txt' filepath.
+            'cookie_source':  '',
+            'impersonate':    True,
         }
         self.data = self._load()
 
@@ -213,6 +234,107 @@ class Settings:
         self.save()
 
 settings = Settings()
+
+# ============================================================================
+# YOUTUBE ANTI-BOT WORKAROUNDS
+# ============================================================================
+# Since 2025 YouTube aggressively blocks unauthenticated, non-browser clients.
+# Depending on the network/IP this shows up as:
+#   - "Sign in to confirm you're not a bot"
+#   - "Please sign in to confirm you're not a bot / age-restriction"
+#   - "This video is unavailable" (even for perfectly valid public videos)
+# These two mitigations dramatically reduce those failures:
+#   1. HTTP request impersonation of a real browser (needs curl_cffi, shipped
+#      with `pip install "yt-dlp[default]"`).
+#   2. Passing your real browser's YouTube cookies so requests look like a
+#      signed-in human from your own machine.
+_YT_IMPERSONATE_CACHE = None  # computed once per process
+
+def _impersonate_available():
+    global _YT_IMPERSONATE_CACHE
+    if _YT_IMPERSONATE_CACHE is None:
+        try:
+            import curl_cffi  # noqa: F401
+            _YT_IMPERSONATE_CACHE = True
+        except ImportError:
+            _YT_IMPERSONATE_CACHE = False
+    return _YT_IMPERSONATE_CACHE
+
+def _make_impersonate_target(name='chrome'):
+    """Return an ImpersonateTarget object (newer yt-dlp requires the object,
+    a plain string raises AssertionError inside YoutubeDL), or None."""
+    try:
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+        return ImpersonateTarget.from_str(name)
+    except Exception:
+        return None
+
+def _detect_available_browser():
+    """Return a browser name whose cookie DB plausibly exists on this machine."""
+    home = Path.home()
+    candidates = [
+        ('chrome',  home / 'AppData/Local/Google/Chrome/User Data'),  # Windows
+        ('chrome',  home / '.config/google-chrome'),                  # Linux
+        ('chrome',  home / 'Library/Application Support/Google/Chrome'),  # macOS
+        ('edge',    home / 'AppData/Local/Microsoft/Edge/User Data'),
+        ('firefox', home / 'AppData/Roaming/Mozilla/Firefox/Profiles'),
+        ('firefox', home / '.mozilla/firefox'),
+        ('brave',   home / 'AppData/Local/BraveSoftware/Brave-Browser/User Data'),
+        ('brave',   home / '.config/BraveSoftware/Brave-Browser'),
+    ]
+    for name, path in candidates:
+        try:
+            if path.exists():
+                return name
+        except OSError:
+            continue
+    return None
+
+def _build_youtube_workaround_opts():
+    """Build yt-dlp options that bypass YouTube's bot checks (best effort)."""
+    opts = {}
+    # 1) Browser TLS/HTTP fingerprint impersonation (must be an
+    #    ImpersonateTarget object for recent yt-dlp versions)
+    if settings.get('impersonate') and _impersonate_available():
+        target = _make_impersonate_target('chrome')
+        if target is not None:
+            opts['impersonate'] = target
+    # 2) Cookies — user-configured source, or auto-detect a local browser
+    src = (settings.get('cookie_source') or '').strip()
+    if src:
+        if src.lower() in ('chrome', 'edge', 'firefox', 'brave', 'safari',
+                           'opera', 'vivaldi', 'chromium'):
+            opts['cookiesfrombrowser'] = (src.lower(),)
+        else:
+            p = Path(src).expanduser()
+            if p.exists():
+                opts['cookiefile'] = str(p)
+    else:
+        browser = _detect_available_browser()
+        if browser:
+            opts['cookiesfrombrowser'] = (browser,)
+    return opts
+
+def _friendly_extract_error(err_text):
+    """Turn raw extractor errors into actionable UI messages."""
+    t = (err_text or '').lower()
+    if 'sign in to confirm' in t or 'not a bot' in t:
+        return ("YouTube blocked this request as automated traffic "
+                "(\"Sign in to confirm you're not a bot\"). This depends on your "
+                "IP/network, not the link. Fixes: open Settings and enable "
+                "\"Use browser identity\", or export cookies.txt and set the "
+                "Cookie source. Also keep yt-dlp updated.")
+    if 'age' in t and 'confirm' in t:
+        return "This video is age-restricted and needs signed-in cookies (Settings → Cookie source)."
+    if 'video unavailable' in t or 'private video' in t:
+        return "Video is private, deleted, region-locked, or unavailable — the link itself cannot be fetched."
+    if 'live stream' in t or 'premiere' in t:
+        return "Live/premiere videos may not be downloadable until the broadcast ends."
+    if 'http error 403' in t:
+        return "Access denied by YouTube (HTTP 403) — usually the same bot check; see Settings → Use browser identity."
+    if 'http error 429' in t:
+        return "Too many requests — wait a few minutes before retrying."
+    return err_text[:200] if err_text else "Unknown error"
 
 # ============================================================================
 # DOWNLOAD HISTORY
@@ -393,6 +515,9 @@ class LinkQueueManager:
                 # Only request the fields we actually display
                 'force_generic_extractor': False,
             }
+            # Anti-bot mitigations (browser impersonation + cookies) so valid
+            # links don't fail with "Sign in to confirm you're not a bot"
+            opts.update(_build_youtube_workaround_opts())
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 # Keep only the fields the UI uses — discard the heavy format list
@@ -410,7 +535,9 @@ class LinkQueueManager:
                     return True, lightweight, None
                 return False, None, "No info returned"
         except Exception as e:
-            return False, None, str(e)[:200]
+            # Show the user an actionable message instead of a raw
+            # "Sign in to confirm you're not a bot..." wall of text
+            return False, None, _friendly_extract_error(str(e))
 
     def add_link(self, url: str) -> Optional[str]:
         if not validate_url(url):
@@ -635,6 +762,10 @@ class DownloadManager:
         if settings.get('sponsorblock'):
             opts['sponsorblock_remove'] = ['sponsor', 'selfpromo', 'interaction']
 
+        # Same anti-bot mitigations as the info-fetch stage, otherwise valid
+        # links fail here with "Sign in to confirm you're not a bot"
+        opts.update(_build_youtube_workaround_opts())
+
         if download_type == 'audio':
             # Extract numeric kbps value: "320 kbps" -> "320"
             quality_val = re.search(r'(\d+)', quality)
@@ -689,7 +820,7 @@ class DownloadManager:
                 if item.id in self.active:
                     del self.active[item.id]
                 item.status = "failed"
-                item.error  = str(e)[:200]
+                item.error  = _friendly_extract_error(str(e))
                 self.failed.append(item)
 
         self._notify()
@@ -2173,6 +2304,28 @@ class MainApplication:
                        activebackground=COLORS['bg_medium'],
                        font=('Segoe UI', 10)).pack(anchor='w', pady=(5, 0))
 
+        # YouTube anti-bot options ("Sign in to confirm you're not a bot" fixes)
+        self.impersonate_var = tk.BooleanVar(value=settings.get('impersonate'))
+        tk.Checkbutton(check_frame,
+                       text="Use browser identity (impersonate Chrome requests)",
+                       variable=self.impersonate_var, bg=COLORS['bg_medium'],
+                       fg=COLORS['text_secondary'], selectcolor=COLORS['bg_light'],
+                       activebackground=COLORS['bg_medium'],
+                       font=('Segoe UI', 10)).pack(anchor='w', pady=(5, 0))
+
+        cookie_frame = tk.Frame(adv_card, bg=COLORS['bg_medium'])
+        cookie_frame.pack(fill='x', padx=12, pady=(8, 0))
+        tk.Label(cookie_frame, text="Cookie source:", font=('Segoe UI', 10),
+                 bg=COLORS['bg_medium'], fg=COLORS['text_secondary']).pack(side='left')
+        self.cookie_source_var = tk.StringVar(value=settings.get('cookie_source') or '')
+        ttk.Combobox(cookie_frame, textvariable=self.cookie_source_var, width=22,
+                     values=['', 'chrome', 'edge', 'firefox', 'brave', 'safari',
+                             'opera', 'vivaldi', 'chromium']).pack(side='left', padx=10)
+        tk.Label(cookie_frame,
+                 text="(empty = auto-detect; or paste path to cookies.txt)",
+                 font=('Segoe UI', 8), bg=COLORS['bg_medium'],
+                 fg=COLORS['text_dim']).pack(side='left')
+
         # Update yt-dlp button in settings
         update_btn_frame = tk.Frame(adv_card, bg=COLORS['bg_medium'])
         update_btn_frame.pack(fill='x', padx=12, pady=(10, 0))
@@ -2199,7 +2352,7 @@ class MainApplication:
                     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 
                 proc = subprocess.Popen(
-                    [sys.executable, "-m", "pip", "install", "-U", "yt-dlp"],
+                    [sys.executable, "-m", "pip", "install", "-U", "yt-dlp[default]"],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     startupinfo=startupinfo, text=True
                 )
@@ -2238,6 +2391,8 @@ class MainApplication:
         settings.set('max_concurrent', int(self.concurrent_var.get()))
         settings.set('auto_paste',     self.auto_paste_var.get())
         settings.set('sponsorblock',   self.sponsorblock_var.get())
+        settings.set('impersonate',    self.impersonate_var.get())
+        settings.set('cookie_source',  self.cookie_source_var.get().strip())
         download_manager.max_workers = int(self.concurrent_var.get())
         messagebox.showinfo("Settings", "Settings saved successfully!")
 
@@ -2455,6 +2610,8 @@ class StartupChecker:
         threading.Thread(target=self._run_checks_thread, daemon=True).start()
 
     def _run_checks_thread(self):
+        # Reset previous results so retrying works correctly after a failure.
+        self.ytdlp_ok = False
         self.root.after(0, lambda: self._set_check_status(0, "checking", "Connecting to YouTube..."))
         time.sleep(0.3)
         import socket
@@ -2471,8 +2628,16 @@ class StartupChecker:
         time.sleep(0.3)
         global yt_dlp
         if yt_dlp is None:
+            # NOTE: a plain "import yt_dlp" inside this method would make yt_dlp a
+            # *local* name for the whole function, which turns the "global yt_dlp"
+            # statement above into an UnboundLocalError (the health-check thread
+            # dies silently and the window freezes at "Connecting to YouTube...").
+            # It would also leave every other user of the module-level yt_dlp stuck
+            # at None. Load it through importlib instead.
             try:
-                import yt_dlp
+                importlib.invalidate_caches()
+                if importlib.util.find_spec("yt_dlp") is not None:
+                    yt_dlp = importlib.import_module("yt_dlp")
             except ImportError:
                 pass
         
@@ -2483,8 +2648,19 @@ class StartupChecker:
                 if sys.platform == "win32":
                     startupinfo = subprocess.STARTUPINFO()
                     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "yt-dlp"], startupinfo=startupinfo)
-                import yt_dlp
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", "yt-dlp[default]"], startupinfo=startupinfo)
+                # A plain "import yt_dlp" here would only bind the local name (and it also
+                # shadows the global), so every other module-level use of yt_dlp would stay None.
+                # Invalidate import caches and load/reload the freshly installed package into the
+                # global namespace instead.
+                importlib.invalidate_caches()
+                if getattr(yt_dlp, "__loader__", None) is not None:
+                    yt_dlp = importlib.reload(yt_dlp)
+                else:
+                    spec = importlib.util.find_spec("yt_dlp")
+                    if spec is None:
+                        raise ImportError("yt_dlp still not found after installation")
+                    yt_dlp = importlib.import_module("yt_dlp")
                 self.ytdlp_ok = True
                 self.root.after(0, lambda: self._set_check_status(1, "pass", "yt-dlp: Installed successfully"))
             except Exception as e:
@@ -2616,7 +2792,7 @@ class StartupChecker:
                 )
                 stdout, stderr = proc.communicate(timeout=300)
                 
-                if is_ffmpeg_available():
+                if is_ffmpeg_available(refresh=True):
                     self.root.after(0, self._on_install_success)
                 else:
                     proc2 = subprocess.Popen(
@@ -2625,7 +2801,7 @@ class StartupChecker:
                         startupinfo=startupinfo, text=True
                     )
                     proc2.communicate(timeout=300)
-                    if is_ffmpeg_available():
+                    if is_ffmpeg_available(refresh=True):
                         self.root.after(0, self._on_install_success)
                     else:
                         self.root.after(0, lambda: self._on_install_failed(stdout + "\n" + stderr))
